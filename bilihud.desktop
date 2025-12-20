@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=BiliHud
+GenericName=Bilibili Danmaku Overlay
+Comment=A Qt-based Bilibili danmaku overlay for fullscreen games
+Exec=bilihud %u
+Icon=bilihud
+Type=Application
+Categories=Utility;Network;
+Terminal=false
+StartupNotify=true
+wmclass=bilihud
