@@ -1,0 +1,73 @@
+[project]
+name = "bilihud"
+version = "0.1.0"
+description = "B站弹幕阅读器 - 一个可以在游戏全屏时显示弹幕的Qt应用程序"
+readme = "README.md"
+authors = [
+  {name = "Locez", email = "locez@locez.com"}
+]
+maintainers = [
+  {name = "Locez", email = "locez@locez.com"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video"
+]
+license = {text = "MIT"}
+dependencies = [
+  "PyQt6",
+  "aiohttp",
+  "qasync",
+  "browser-cookie3",
+
+  # for blivedm
+  "brotli",
+  "pure_protobuf"
+]
+requires-python = ">= 3.10"
+
+[project.optional-dependencies]
+test = [
+    "coverage",  # testing
+    "pytest",  # testing
+    "ruff",  # linting
+    "ty", # checking types
+    "ipdb", # debugging
+]
+
+[project.urls]
+bugs = "https://github.com/locez/bilihud/issues"
+changelog = "https://github.com/locez/bilihud/blob/master/changelog.md"
+homepage = "https://github.com/locez/bilihud"
+
+[project.scripts]
+bilihud = "bilihud.main:entry_point"
+
+[tool.ty]
+# All rules are enabled as "error" by default; no need to specify unless overriding.
+# Example override: relax a rule for the entire project (uncomment if needed).
+# rules.TY015 = "warn"  # For invalid-argument-type, warn instead of error.
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+
+[tool.uv]
+package = true
