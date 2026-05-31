@@ -28,6 +28,7 @@ import blivedm.models.web as web_models
 from .danmaku_client import DanmakuClient
 from .utils import load_config, save_config
 from .qr_login_dialog import QRLoginDialog
+from .live_control_dialog import LiveControlDialog
 from .auth import AuthManager
 
 class ModernInputWidget(QWidget):
@@ -784,6 +785,10 @@ class DanmakuWidget(QWidget):
         self.tray_login_action = QAction("扫码登录", self)
         self.tray_login_action.triggered.connect(self.open_qr_login)
         tray_menu.addAction(self.tray_login_action)
+
+        self.tray_live_control_action = QAction("直播控制", self)
+        self.tray_live_control_action.triggered.connect(self.open_live_control)
+        tray_menu.addAction(self.tray_live_control_action)
         
         quit_action = QAction("退出程序", self)
         quit_action.triggered.connect(self.quit_app)
@@ -1192,6 +1197,15 @@ class DanmakuWidget(QWidget):
         # [Optimization] Reduce max history to 200 to prevent render lag
         if self.danmaku_list.count() > 200:
             self.danmaku_list.takeItem(0)
+
+    def open_live_control(self):
+        """打开直播控制窗口"""
+        if not hasattr(self, '_live_control_dialog'):
+            self._live_control_dialog = LiveControlDialog(self)
+        self._live_control_dialog.set_room_id(self.room_id)
+        self._live_control_dialog.show()
+        self._live_control_dialog.raise_()
+        self._live_control_dialog.activateWindow()
 
     def open_qr_login(self):
         """打开扫码登录窗口"""
