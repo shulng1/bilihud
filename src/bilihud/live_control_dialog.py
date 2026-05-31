@@ -51,7 +51,10 @@ class LiveControlDialog(QDialog):
         self.session: aiohttp.ClientSession | None = None
         self.area_list: list[dict[str, Any]] = []
         self.credentials: list[StreamCredential] = []
-        self._initial_load_started = False
+        self._initial_load_task: asyncio.Task[None] | None = None
+        self._load_generation = 0
+        self._session_cleanup_task: asyncio.Task[None] | None = None
+        self._sessions_pending_close: list[aiohttp.ClientSession] = []
         self._busy = False
 
         self._init_ui()
@@ -191,33 +194,88 @@ class LiveControlDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if not self._initial_load_started or self.session is None or self.session.closed:
-            self._initial_load_started = True
-            asyncio.create_task(self.load_initial_state())
+        if self._initial_load_task and not self._initial_load_task.done():
+            return
+        if self.session and not self.session.closed:
+            self._update_action_state()
+            return
+
+        self._load_generation += 1
+        self._initial_load_task = asyncio.create_task(self.load_initial_state(self._load_generation))
+        self._initial_load_task.add_done_callback(self._consume_task_exception)
 
     def closeEvent(self, event) -> None:
-        if self.session and not self.session.closed:
-            asyncio.create_task(self.session.close())
-        self._initial_load_started = False
+        self._load_generation += 1
+        if self._initial_load_task and not self._initial_load_task.done():
+            self._initial_load_task.cancel()
+        self._clear_credentials()
+        self._schedule_session_cleanup(self.session)
+        self.session = None
+        self._busy = False
+        self._update_action_state()
         super().closeEvent(event)
 
-    async def load_initial_state(self) -> None:
+    async def load_initial_state(self, generation: int) -> None:
         self._set_busy(True, "正在加载登录状态和直播分区...")
+        session: aiohttp.ClientSession | None = None
         try:
-            self.session, _from_keyring = await self.auth_manager.create_authenticated_session()
+            session, _from_keyring = await self.auth_manager.create_authenticated_session()
+            if generation != self._load_generation:
+                self._schedule_session_cleanup(session)
+                return
+
+            self.session = session
             if self._has_csrf():
                 self.set_status("登录状态可用。")
             else:
                 self.set_status("未找到 CSRF Token，请先通过托盘菜单扫码登录。", error=True)
 
-            self.area_list = await get_area_list(self.session)
+            area_list = await get_area_list(self.session)
+            if generation != self._load_generation:
+                return
+
+            self.area_list = area_list
             self._populate_parent_areas()
             self._restore_saved_area()
+        except asyncio.CancelledError:
+            self._schedule_session_cleanup(session)
+            raise
         except Exception as exc:
-            logger.exception("Failed to initialize live control dialog")
-            self.set_status(f"初始化失败: {exc}", error=True)
+            if generation == self._load_generation:
+                logger.exception("Failed to initialize live control dialog")
+                self.set_status(f"初始化失败: {exc}", error=True)
         finally:
-            self._set_busy(False)
+            if generation == self._load_generation:
+                self._set_busy(False)
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Unhandled live control dialog task error")
+
+    def _schedule_session_cleanup(self, session: aiohttp.ClientSession | None) -> None:
+        if session and not session.closed and session not in self._sessions_pending_close:
+            self._sessions_pending_close.append(session)
+
+        if self._sessions_pending_close and (
+            self._session_cleanup_task is None or self._session_cleanup_task.done()
+        ):
+            self._session_cleanup_task = asyncio.create_task(self._close_pending_sessions())
+            self._session_cleanup_task.add_done_callback(self._consume_task_exception)
+
+    async def _close_pending_sessions(self) -> None:
+        while self._sessions_pending_close:
+            session = self._sessions_pending_close.pop(0)
+            if session.closed:
+                continue
+            try:
+                await session.close()
+            except Exception:
+                logger.exception("Failed to close live control session")
 
     def _populate_parent_areas(self) -> None:
         self.parent_area_combo.blockSignals(True)
@@ -426,14 +484,17 @@ class LiveControlDialog(QDialog):
         self._set_busy(True, "正在停止直播...")
         try:
             await stop_live(self.session, room_id)
-            self.credentials = []
-            self._render_credentials()
+            self._clear_credentials()
             self.set_status("直播已停止。")
         except Exception as exc:
             logger.exception("Failed to stop live")
             self.set_status(f"停止直播失败: {exc}", error=True)
         finally:
             self._set_busy(False)
+
+    def _clear_credentials(self) -> None:
+        self.credentials = []
+        self._render_credentials()
 
     def _render_credentials(self) -> None:
         while self.credentials_layout.count():
