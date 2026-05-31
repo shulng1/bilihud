@@ -194,6 +194,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local git worktrees used by development agents
+.worktrees
+.worktrees/
+
 # PyPI configuration file
 .pypirc
 
