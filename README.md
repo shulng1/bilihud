@@ -16,6 +16,9 @@
 ### 游戏穿透模式 (Pass-through)
 ![Pass-through Mode](screenshots/passthrough.png)
 
+### 直播控制与 OBS 推流
+![Live Control](screenshots/live-control.png)
+
 ## 功能特点
 
 * 实时显示B站直播间弹幕
@@ -25,6 +28,8 @@
 * 显示用户名、舰长/VIP标识
 * 支持发送弹幕
 * 支持扫码登录
+* 支持直播控制：读取历史标题和当前分区，更新标题/分区，开始/停止直播并展示 RTMP/SRT 推流凭证
+* 支持 OBS WebSocket 联动：检查/启动 OBS，开播后自动填入 RTMP 地址和密钥并触发 OBS 开始推流
 * **注意：** 使用 layer-shell-qt 支持 wayland 环境
 
 ## 极速上手
@@ -81,6 +86,16 @@ source .venv/bin/activate
 ```bash
 python -m src.bilihud.main
 ```
+
+### 3. 开播与 OBS 推流
+
+在托盘图标右键菜单中选择"直播控制"即可打开开播窗口。首次使用前请先通过"扫码登录"完成 Bilibili 登录，否则无法获取开播所需的 CSRF Token。
+
+开播窗口会自动读取直播间历史标题和当前分区。您可以直接修改标题，或在分区输入框中搜索并选择目标分区；点击"开始直播"后，BiliHUD 会调用 Bilibili 开播接口并在下方显示 RTMP/SRT 地址和密钥。若开播需要扫码验证或人脸认证，窗口会弹出对应验证入口，完成后再次点击"开始直播"即可。
+
+如果需要联动 OBS，请在 OBS 中启用 WebSocket 服务，并在开播窗口填写 OBS 地址、端口和密码。OBS 28 及以上版本内置 WebSocket，默认端口通常为 `4455`。点击"检查 OBS"确认可连接后，再点击"开始直播"，BiliHUD 会把 RTMP 推流地址和密钥写入 OBS 并触发 OBS 开始推流。
+
+如果 OBS 未配置、WebSocket 不可连接或自动推流失败，开播成功后仍会显示推流地址和密钥，您可以手动复制到 OBS 中使用。
 
 ## 隐私说明 & 配置
 

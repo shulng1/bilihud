@@ -4,11 +4,12 @@ from typing import Any
 
 import aiohttp
 import qasync
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCompleter,
     QDialog,
     QFrame,
     QGridLayout,
@@ -25,16 +26,31 @@ from PyQt6.QtWidgets import (
 from .auth import AuthManager
 from .live_api import (
     LiveApiError,
+    RoomInfo,
     StreamCredential,
-    format_face_auth_url,
+    extract_qr_url,
     get_area_list,
     get_cookie_value,
     get_live_version,
+    get_room_info,
+    is_live_rate_limited_error,
     parse_stream_credentials,
+    room_action_enabled_state,
+    room_area_needs_update,
+    room_title_needs_update,
     start_live,
+    start_live_verification_url,
     stop_live,
     update_room_area,
     update_room_title,
+)
+from .obs_api import (
+    ObsApiError,
+    ObsWebSocketClient,
+    is_obs_process_running,
+    launch_obs,
+    obs_check_button_state,
+    pick_primary_credential,
 )
 from .utils import load_config, save_config, validate_room_id
 
@@ -42,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 
 class LiveControlDialog(QDialog):
+    live_status_changed = pyqtSignal(bool)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("直播控制")
@@ -51,12 +69,18 @@ class LiveControlDialog(QDialog):
         self.session: aiohttp.ClientSession | None = None
         self.area_list: list[dict[str, Any]] = []
         self.credentials: list[StreamCredential] = []
+        self.current_room_info: RoomInfo | None = None
+        self.is_live_active = False
         self._initial_load_task: asyncio.Task[None] | None = None
+        self._room_info_task: asyncio.Task[None] | None = None
+        self._obs_write_task: asyncio.Task[None] | None = None
         self._load_generation = 0
         self._action_generation = 0
         self._session_cleanup_task: asyncio.Task[None] | None = None
         self._sessions_pending_close: list[aiohttp.ClientSession] = []
         self._busy = False
+        self._obs_busy = False
+        self._obs_connected = False
 
         self._init_ui()
         self._load_config_values()
@@ -69,7 +93,7 @@ class LiveControlDialog(QDialog):
 
         self.status_label = QLabel("打开后会加载登录状态和直播分区。")
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #dddddd;")
+        self._set_status_style("info")
         main_layout.addWidget(self.status_label)
 
         form = QFrame(self)
@@ -91,6 +115,14 @@ class LiveControlDialog(QDialog):
                 border-radius: 4px;
                 padding: 5px 7px;
             }
+            QComboBox QAbstractItemView {
+                color: #eeeeee;
+                background: #2b2b2b;
+                selection-color: #111111;
+                selection-background-color: #ff6ab3;
+                border: 1px solid #4a4a4a;
+                outline: none;
+            }
             QPushButton {
                 color: #ffffff;
                 background: #00a1d6;
@@ -111,10 +143,12 @@ class LiveControlDialog(QDialog):
         form_layout.setContentsMargins(12, 12, 12, 12)
         form_layout.setHorizontalSpacing(10)
         form_layout.setVerticalSpacing(10)
+        form_layout.setColumnStretch(1, 1)
 
         self.room_id_input = QLineEdit()
         self.room_id_input.setPlaceholderText("直播间 ID")
         self.room_id_input.textChanged.connect(self._update_action_state)
+        self.room_id_input.editingFinished.connect(self.reload_room_info)
         form_layout.addWidget(QLabel("房间号"), 0, 0)
         form_layout.addWidget(self.room_id_input, 0, 1, 1, 2)
 
@@ -125,20 +159,25 @@ class LiveControlDialog(QDialog):
         form_layout.addWidget(self.title_input, 1, 1)
 
         self.update_title_btn = QPushButton("更新标题")
+        self.update_title_btn.setMinimumWidth(90)
         self.update_title_btn.clicked.connect(self.handle_update_title)
         form_layout.addWidget(self.update_title_btn, 1, 2)
 
         self.parent_area_combo = QComboBox()
+        self._setup_searchable_combo(self.parent_area_combo, "搜索分类")
+        self.parent_area_combo.lineEdit().textEdited.connect(lambda _text: self._on_parent_area_changed())
         self.parent_area_combo.currentIndexChanged.connect(self._on_parent_area_changed)
         form_layout.addWidget(QLabel("分类"), 2, 0)
         form_layout.addWidget(self.parent_area_combo, 2, 1, 1, 2)
 
         self.area_combo = QComboBox()
+        self._setup_searchable_combo(self.area_combo, "搜索分区")
         self.area_combo.currentIndexChanged.connect(self._update_action_state)
         form_layout.addWidget(QLabel("分区"), 3, 0)
         form_layout.addWidget(self.area_combo, 3, 1)
 
         self.update_area_btn = QPushButton("更新分区")
+        self.update_area_btn.setMinimumWidth(90)
         self.update_area_btn.clicked.connect(self.handle_update_area)
         form_layout.addWidget(self.update_area_btn, 3, 2)
 
@@ -150,6 +189,35 @@ class LiveControlDialog(QDialog):
         action_row.addWidget(self.start_btn)
         action_row.addWidget(self.stop_btn)
         form_layout.addLayout(action_row, 4, 0, 1, 3)
+
+        self.obs_host_input = QLineEdit()
+        self.obs_host_input.setPlaceholderText("127.0.0.1")
+        self.obs_host_input.textChanged.connect(self._update_action_state)
+        self.obs_host_input.textEdited.connect(self._mark_obs_unchecked)
+        self.obs_port_input = QLineEdit()
+        self.obs_port_input.setPlaceholderText("4455")
+        self.obs_port_input.setFixedWidth(72)
+        self.obs_port_input.textChanged.connect(self._update_action_state)
+        self.obs_port_input.textEdited.connect(self._mark_obs_unchecked)
+        obs_endpoint_row = QHBoxLayout()
+        obs_endpoint_row.setContentsMargins(0, 0, 0, 0)
+        obs_endpoint_row.setSpacing(8)
+        obs_endpoint_row.addWidget(self.obs_host_input)
+        obs_endpoint_row.addWidget(self.obs_port_input)
+        form_layout.addWidget(QLabel("OBS"), 5, 0)
+        form_layout.addLayout(obs_endpoint_row, 5, 1, 1, 2)
+
+        self.obs_password_input = QLineEdit()
+        self.obs_password_input.setPlaceholderText("OBS WebSocket 密码，可留空")
+        self.obs_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.obs_password_input.textChanged.connect(self._update_action_state)
+        self.obs_password_input.textEdited.connect(self._mark_obs_unchecked)
+        self.write_obs_btn = QPushButton("检查 OBS")
+        self.write_obs_btn.setMinimumWidth(90)
+        self.write_obs_btn.clicked.connect(self.handle_check_obs)
+        form_layout.addWidget(QLabel("密码"), 6, 0)
+        form_layout.addWidget(self.obs_password_input, 6, 1)
+        form_layout.addWidget(self.write_obs_btn, 6, 2)
         main_layout.addWidget(form)
 
         credentials_title = QLabel("推流凭证")
@@ -183,11 +251,37 @@ class LiveControlDialog(QDialog):
         close_row.addWidget(self.close_btn)
         main_layout.addLayout(close_row)
 
+    def _setup_searchable_combo(self, combo: QComboBox, placeholder: str) -> None:
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setMaxVisibleItems(18)
+        combo.setMinimumContentsLength(14)
+        combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        combo.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        combo.lineEdit().setPlaceholderText(placeholder)
+        combo.lineEdit().textEdited.connect(self._update_action_state)
+        popup_style = """
+            QListView, QAbstractItemView {
+                color: #eeeeee;
+                background: #2b2b2b;
+                selection-color: #111111;
+                selection-background-color: #ff6ab3;
+                border: 1px solid #4a4a4a;
+                outline: none;
+            }
+        """
+        combo.view().setStyleSheet(popup_style)
+        combo.completer().popup().setStyleSheet(popup_style)
+
     def _load_config_values(self) -> None:
         config = load_config()
         room_id = config.get("room_id", "")
         self.room_id_input.setText(str(room_id) if room_id else "")
         self.title_input.setText(str(config.get("live_title", "")))
+        self.obs_host_input.setText(str(config.get("obs_host", "127.0.0.1")))
+        self.obs_port_input.setText(str(config.get("obs_port", "4455")))
+        self.obs_password_input.setText(str(config.get("obs_password", "")))
 
     def set_room_id(self, room_id: int) -> None:
         if room_id > 0:
@@ -210,6 +304,10 @@ class LiveControlDialog(QDialog):
         self._action_generation += 1
         if self._initial_load_task and not self._initial_load_task.done():
             self._initial_load_task.cancel()
+        if self._room_info_task and not self._room_info_task.done():
+            self._room_info_task.cancel()
+        if self._obs_write_task and not self._obs_write_task.done():
+            self._obs_write_task.cancel()
         self._clear_credentials()
         self._schedule_session_cleanup(self.session)
         self.session = None
@@ -238,7 +336,7 @@ class LiveControlDialog(QDialog):
 
             self.area_list = area_list
             self._populate_parent_areas()
-            self._restore_saved_area()
+            await self._load_room_info(generation, update_status=self._has_csrf())
         except asyncio.CancelledError:
             self._schedule_session_cleanup(session)
             raise
@@ -287,10 +385,88 @@ class LiveControlDialog(QDialog):
         self.parent_area_combo.blockSignals(False)
         self._on_parent_area_changed()
 
+    async def _load_room_info(self, generation: int, update_status: bool = True) -> bool:
+        room_id = self._room_id()
+        if room_id is None or self.session is None:
+            self.current_room_info = None
+            self._restore_saved_area()
+            return False
+
+        try:
+            room_info = await get_room_info(self.session, room_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("Failed to load room info for %s: %s", room_id, exc)
+            if generation == self._load_generation:
+                self.current_room_info = None
+                self._restore_saved_area()
+            return False
+
+        if generation != self._load_generation:
+            return False
+
+        self.current_room_info = room_info
+        self._set_live_active(room_info.is_live)
+        if room_info.title:
+            self.title_input.setText(room_info.title)
+        self._select_area(room_info.parent_area_id, room_info.area_id)
+        if update_status:
+            self.set_status("已加载直播间当前标题和分区。")
+        return True
+
+    @qasync.asyncSlot()
+    async def reload_room_info(self) -> None:
+        if self._busy or not self.area_list or not self.session or self.session.closed:
+            return
+        if self._room_id() is None:
+            self.current_room_info = None
+            self._restore_saved_area()
+            self.set_status("房间号无效，无法加载直播间当前标题和分区。", error=True)
+            self._update_action_state()
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self._room_info_task = task
+        has_csrf = self._has_csrf()
+        if has_csrf:
+            self.set_status("正在加载直播间当前标题和分区...")
+        try:
+            loaded = await self._load_room_info(self._load_generation, update_status=has_csrf)
+            if not has_csrf:
+                self.set_status("未找到 CSRF Token，请先通过托盘菜单扫码登录。", error=True)
+            elif not loaded and self.isVisible():
+                self.set_status("未能加载直播间当前标题和分区，已使用保存的分区。", error=True)
+        finally:
+            if self._room_info_task is task:
+                self._room_info_task = None
+            self._update_action_state()
+
     def _restore_saved_area(self) -> None:
         config = load_config()
         parent_id = str(config.get("live_parent_area_id", ""))
         area_id = str(config.get("live_area_id", ""))
+        self._select_area(parent_id, area_id)
+
+    def _remember_synced_title(self, room_id: int, title: str) -> None:
+        current = self.current_room_info
+        self.current_room_info = RoomInfo(
+            room_id=room_id,
+            title=title,
+            parent_area_id=current.parent_area_id if current and current.room_id == room_id else "",
+            area_id=current.area_id if current and current.room_id == room_id else "",
+        )
+
+    def _remember_synced_area(self, room_id: int, area_id: str) -> None:
+        current = self.current_room_info
+        self.current_room_info = RoomInfo(
+            room_id=room_id,
+            title=current.title if current and current.room_id == room_id else "",
+            parent_area_id=self._selected_parent_area_id(),
+            area_id=area_id,
+        )
+
+    def _select_area(self, parent_id: str, area_id: str) -> None:
         if parent_id:
             parent_index = self.parent_area_combo.findData(parent_id)
             if parent_index >= 0:
@@ -301,7 +477,7 @@ class LiveControlDialog(QDialog):
                 self.area_combo.setCurrentIndex(area_index)
 
     def _on_parent_area_changed(self) -> None:
-        current_parent_id = str(self.parent_area_combo.currentData() or "")
+        current_parent_id = self._selected_parent_area_id()
         selected_parent = next(
             (parent for parent in self.area_list if str(parent.get("id") or "") == current_parent_id),
             None,
@@ -322,7 +498,38 @@ class LiveControlDialog(QDialog):
         return int(text)
 
     def _selected_area_id(self) -> str:
-        return str(self.area_combo.currentData() or "")
+        return self._selected_combo_data(self.area_combo)
+
+    def _selected_parent_area_id(self) -> str:
+        return self._selected_combo_data(self.parent_area_combo)
+
+    @staticmethod
+    def _selected_combo_data(combo: QComboBox) -> str:
+        current_text = combo.currentText()
+        current_index = combo.currentIndex()
+        if current_index < 0 or current_text != combo.itemText(current_index):
+            current_index = combo.findText(current_text, Qt.MatchFlag.MatchFixedString)
+        if current_index < 0:
+            return ""
+        return str(combo.itemData(current_index) or "")
+
+    def _obs_port(self) -> int | None:
+        try:
+            port = int(self.obs_port_input.text().strip() or "4455")
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def _obs_client(self) -> ObsWebSocketClient | None:
+        port = self._obs_port()
+        if port is None:
+            self.set_status("OBS 端口无效。", error=True)
+            return None
+        return ObsWebSocketClient(
+            host=self.obs_host_input.text().strip() or "127.0.0.1",
+            port=port,
+            password=self.obs_password_input.text(),
+        )
 
     def _has_csrf(self) -> bool:
         return bool(self.session and not self.session.closed and get_cookie_value(self.session, "bili_jct"))
@@ -336,8 +543,29 @@ class LiveControlDialog(QDialog):
         has_csrf = self._has_csrf()
         self.update_title_btn.setEnabled(has_room and has_title and has_csrf)
         self.update_area_btn.setEnabled(has_room and has_area and has_csrf)
-        self.start_btn.setEnabled(has_room and has_title and has_area and has_csrf)
-        self.stop_btn.setEnabled(has_room and has_csrf)
+        can_start = has_room and has_title and has_area and has_csrf
+        can_stop = has_room and has_csrf
+        start_enabled, stop_enabled = room_action_enabled_state(can_start, can_stop, self.is_live_active)
+        self.start_btn.setEnabled(start_enabled)
+        self.stop_btn.setEnabled(stop_enabled)
+        obs_enabled, obs_text = obs_check_button_state(
+            port_valid=self._obs_port() is not None,
+            checking=self._obs_busy,
+            connected=self._obs_connected,
+        )
+        self.write_obs_btn.setEnabled(obs_enabled)
+        self.write_obs_btn.setText(obs_text)
+
+    def _mark_obs_unchecked(self) -> None:
+        self._obs_connected = False
+        self._update_action_state()
+
+    def _set_live_active(self, is_live: bool) -> None:
+        if self.is_live_active == is_live:
+            return
+        self.is_live_active = is_live
+        self.live_status_changed.emit(is_live)
+        self._update_action_state()
 
     def _set_busy(self, busy: bool, message: str | None = None) -> None:
         self._busy = busy
@@ -350,6 +578,10 @@ class LiveControlDialog(QDialog):
             self.update_area_btn,
             self.start_btn,
             self.stop_btn,
+            self.obs_host_input,
+            self.obs_port_input,
+            self.obs_password_input,
+            self.write_obs_btn,
         ):
             widget.setEnabled(not busy)
         if message:
@@ -357,9 +589,29 @@ class LiveControlDialog(QDialog):
         if not busy:
             self._update_action_state()
 
-    def set_status(self, message: str, error: bool = False) -> None:
+    def _set_status_style(self, level: str) -> None:
+        colors = {
+            "info": ("#102534", "#49c8f5", "#d9f6ff"),
+            "success": ("#13311f", "#44d17a", "#e2ffe9"),
+            "error": ("#3a1717", "#ff6b6b", "#ffe0e0"),
+        }
+        background, border, foreground = colors.get(level, colors["info"])
+        self.status_label.setStyleSheet(
+            f"""
+            QLabel {{
+                color: {foreground};
+                background: {background};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-weight: 700;
+            }}
+            """
+        )
+
+    def set_status(self, message: str, error: bool = False, success: bool = False) -> None:
         self.status_label.setText(message)
-        self.status_label.setStyleSheet("color: #ff7777;" if error else "color: #dddddd;")
+        self._set_status_style("error" if error else "success" if success else "info")
 
     def _save_form_config(self) -> None:
         room_id = self._room_id()
@@ -367,8 +619,11 @@ class LiveControlDialog(QDialog):
             {
                 "room_id": room_id if room_id is not None else self.room_id_input.text().strip(),
                 "live_title": self.title_input.text().strip(),
-                "live_parent_area_id": str(self.parent_area_combo.currentData() or ""),
+                "live_parent_area_id": self._selected_parent_area_id(),
                 "live_area_id": self._selected_area_id(),
+                "obs_host": self.obs_host_input.text().strip() or "127.0.0.1",
+                "obs_port": self.obs_port_input.text().strip() or "4455",
+                "obs_password": self.obs_password_input.text(),
             }
         )
 
@@ -383,6 +638,37 @@ class LiveControlDialog(QDialog):
             and self.session is session
             and not session.closed
         )
+
+    async def _sync_room_before_start(
+        self,
+        session: aiohttp.ClientSession,
+        room_id: int,
+        title: str,
+        area_id: str,
+    ) -> None:
+        if room_title_needs_update(self.current_room_info, room_id, title):
+            await update_room_title(session, room_id, title)
+            self._remember_synced_title(room_id, title)
+
+        if room_area_needs_update(self.current_room_info, room_id, area_id):
+            await update_room_area(session, room_id, area_id)
+            self._remember_synced_area(room_id, area_id)
+
+    async def _sync_room_before_start_lenient(
+        self,
+        session: aiohttp.ClientSession,
+        room_id: int,
+        title: str,
+        area_id: str,
+    ) -> None:
+        try:
+            await self._sync_room_before_start(session, room_id, title, area_id)
+        except LiveApiError as exc:
+            if is_live_rate_limited_error(exc):
+                logger.info("Room update skipped before start because Bilibili rate limited it: %s", exc)
+                self.set_status("直播间信息刚更新过，已跳过重复同步并继续开播...")
+                return
+            raise
 
     @qasync.asyncSlot()
     async def handle_update_title(self) -> None:
@@ -400,6 +686,7 @@ class LiveControlDialog(QDialog):
             await update_room_title(session, room_id, title)
             if not self._is_current_action(action_generation, session):
                 return
+            self._remember_synced_title(room_id, title)
             self._save_form_config()
             self.set_status("直播间标题已更新。")
         except Exception as exc:
@@ -426,6 +713,7 @@ class LiveControlDialog(QDialog):
             await update_room_area(session, room_id, area_id)
             if not self._is_current_action(action_generation, session):
                 return
+            self._remember_synced_area(room_id, area_id)
             self._save_form_config()
             self.set_status("直播间分区已更新。")
         except Exception as exc:
@@ -452,10 +740,7 @@ class LiveControlDialog(QDialog):
         self._set_busy(True, "正在开始直播...")
         try:
             self._save_form_config()
-            await update_room_title(session, room_id, title)
-            if not self._is_current_action(action_generation, session):
-                return
-            await update_room_area(session, room_id, area_id)
+            await self._sync_room_before_start_lenient(session, room_id, title, area_id)
             if not self._is_current_action(action_generation, session):
                 return
             version = await get_live_version(session)
@@ -481,21 +766,25 @@ class LiveControlDialog(QDialog):
         if code == 0:
             self.credentials = parse_stream_credentials(data)
             self._render_credentials()
+            self._set_live_active(True)
             if self.credentials:
-                self.set_status("直播已开始，推流凭证已生成。")
+                self.set_status("直播已开始，推流凭证已生成；正在尝试连接 OBS 自动推流。", success=True)
+                self._obs_write_task = asyncio.create_task(self._write_obs_after_start())
+                self._obs_write_task.add_done_callback(self._consume_task_exception)
             else:
                 self.set_status("直播已开始，但接口未返回可识别的推流凭证。", error=True)
             return
 
         if code == 60024:
-            self._show_qr_verification(self._extract_qr_url(data))
+            self._show_qr_verification(start_live_verification_url(code, data, uid=None))
             self.set_status("本次开播需要扫码验证，完成后请重新点击开始直播。", error=True)
             return
 
         if code == 60043:
             uid = get_cookie_value(self.session, "DedeUserID") if self.session else None
-            if uid:
-                self._show_text_dialog("人脸认证", format_face_auth_url(uid))
+            auth_url = start_live_verification_url(code, data, uid=uid)
+            if auth_url:
+                self._show_qr_verification(auth_url, title="人脸认证")
             else:
                 self._show_text_dialog("人脸认证", "本次开播需要人脸认证，但当前会话缺少 DedeUserID。")
             self.set_status("本次开播需要人脸认证，完成后请重新点击开始直播。", error=True)
@@ -505,11 +794,7 @@ class LiveControlDialog(QDialog):
 
     @staticmethod
     def _extract_qr_url(data: dict[str, Any]) -> str:
-        for key in ("qr", "qrcode", "qrcode_url", "url"):
-            value = data.get(key)
-            if value:
-                return str(value)
-        return ""
+        return extract_qr_url(data)
 
     @qasync.asyncSlot()
     async def handle_stop_live(self) -> None:
@@ -528,6 +813,7 @@ class LiveControlDialog(QDialog):
             if not self._is_current_action(action_generation, session):
                 return
             self._clear_credentials()
+            self._set_live_active(False)
             self.set_status("直播已停止。")
         except Exception as exc:
             if self._is_current_action(action_generation, session):
@@ -536,6 +822,81 @@ class LiveControlDialog(QDialog):
         finally:
             if self._is_current_action(action_generation, session):
                 self._set_busy(False)
+
+    async def _write_obs_after_start(self) -> None:
+        await self.start_obs_stream(auto=True)
+
+    @qasync.asyncSlot()
+    async def handle_check_obs(self) -> None:
+        client = self._obs_client()
+        if client is None:
+            return
+
+        self._save_form_config()
+        self._obs_busy = True
+        self._update_action_state()
+        self.set_status("正在检查 OBS WebSocket...")
+        try:
+            try:
+                await client.check_connection()
+            except ObsApiError as exc:
+                logger.info("OBS WebSocket check failed: %s", exc)
+                self._obs_connected = False
+            else:
+                self._obs_connected = True
+                self.set_status("OBS 已启动并且 WebSocket 可连接。点击“开始直播”会自动推流。", success=True)
+                return
+
+            try:
+                if is_obs_process_running():
+                    self._obs_connected = False
+                    self.set_status("OBS 已启动，但 WebSocket 无法连接。请检查 OBS WebSocket 设置。", error=True)
+                    return
+                launch_obs()
+                self._obs_connected = False
+                self.set_status("已启动 OBS。请等待 OBS 完成加载，然后点击“开始直播”。", success=True)
+            except ObsApiError as exc:
+                self.set_status(f"启动 OBS 失败: {exc}", error=True)
+            except Exception as exc:
+                logger.exception("Unexpected OBS launch failure")
+                self.set_status(f"启动 OBS 失败: {exc}", error=True)
+        finally:
+            self._obs_busy = False
+            self._update_action_state()
+
+    async def start_obs_stream(self, auto: bool = False) -> None:
+        credential = pick_primary_credential(self.credentials)
+        if credential is None:
+            if not auto:
+                self.set_status("没有可用于启动 OBS 推流的凭证。", error=True)
+            return
+        client = self._obs_client()
+        if client is None:
+            return
+
+        self._save_form_config()
+        self._obs_busy = True
+        self._update_action_state()
+        if not auto:
+            self.set_status("正在填入 OBS 推流设置并启动推流...")
+        try:
+            await client.set_stream_service_settings_and_start(credential)
+            self.set_status(f"已将 {credential.label.upper()} 填入 OBS 并启动推流。", success=True)
+        except ObsApiError as exc:
+            logger.info("Failed to write OBS stream settings: %s", exc)
+            if not auto:
+                self.set_status(f"启动 OBS 推流失败: {exc}", error=True)
+            elif self.credentials:
+                self.set_status("直播已开始，RTMP 凭证已生成；OBS 自动推流失败，可手动复制地址和密钥。", error=True)
+        except Exception as exc:
+            logger.exception("Unexpected OBS write failure")
+            if not auto:
+                self.set_status(f"启动 OBS 推流失败: {exc}", error=True)
+            elif self.credentials:
+                self.set_status("直播已开始，RTMP 凭证已生成；OBS 自动推流失败，可手动复制地址和密钥。", error=True)
+        finally:
+            self._obs_busy = False
+            self._update_action_state()
 
     def _clear_credentials(self) -> None:
         self.credentials = []
@@ -623,13 +984,13 @@ class LiveControlDialog(QDialog):
         QApplication.clipboard().setText(text)
         self.set_status("已复制到剪贴板。")
 
-    def _show_qr_verification(self, url: str) -> None:
+    def _show_qr_verification(self, url: str, title: str = "开播验证") -> None:
         if not url:
-            self._show_text_dialog("开播验证", "本次开播需要扫码验证，但接口未返回二维码地址。")
+            self._show_text_dialog(title, "本次开播需要扫码验证，但接口未返回二维码地址。")
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("开播验证")
+        dialog.setWindowTitle(title)
         layout = QVBoxLayout(dialog)
 
         prompt = QLabel("请使用哔哩哔哩 App 扫码完成验证，完成后重新点击开始直播。")

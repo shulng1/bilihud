@@ -31,6 +31,15 @@ class LiveVersion:
 
 
 @dataclass(frozen=True)
+class RoomInfo:
+    room_id: int
+    title: str
+    parent_area_id: str
+    area_id: str
+    is_live: bool = False
+
+
+@dataclass(frozen=True)
 class StartLiveResult:
     code: int
     message: str
@@ -56,6 +65,38 @@ def format_face_auth_url(uid: str | int) -> str:
         "https://www.bilibili.com/blackboard/live/face-auth-middle.html"
         f"?source_event=400&mid={uid}"
     )
+
+
+def extract_qr_url(data: Mapping[str, Any]) -> str:
+    for key in ("qr", "qrcode", "qrcode_url", "url"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def start_live_verification_url(code: int, data: Mapping[str, Any], uid: str | int | None) -> str:
+    if code == 60024:
+        return extract_qr_url(data)
+    if code == 60043 and uid:
+        return format_face_auth_url(uid)
+    return ""
+
+
+def is_live_rate_limited_error(exc: BaseException) -> bool:
+    return isinstance(exc, LiveApiError) and exc.code == -1 and "操作太频繁" in str(exc)
+
+
+def room_title_needs_update(current_room: RoomInfo | None, room_id: int, title: str) -> bool:
+    return current_room is None or current_room.room_id != room_id or current_room.title.strip() != title.strip()
+
+
+def room_area_needs_update(current_room: RoomInfo | None, room_id: int, area_id: str) -> bool:
+    return current_room is None or current_room.room_id != room_id or current_room.area_id != area_id
+
+
+def room_action_enabled_state(can_start: bool, can_stop: bool, is_live: bool) -> tuple[bool, bool]:
+    return (can_start and not is_live, can_stop and is_live)
 
 
 def get_cookie_value(session: aiohttp.ClientSession, name: str) -> str | None:
@@ -95,6 +136,16 @@ def parse_stream_credentials(start_live_data: Mapping[str, Any]) -> list[StreamC
         credentials.append(StreamCredential(f"{protocol}-{counters[protocol]}", addr, code))
 
     return sorted(credentials, key=lambda item: item.label)
+
+
+def parse_room_info(room_data: Mapping[str, Any]) -> RoomInfo:
+    return RoomInfo(
+        room_id=int(room_data.get("room_id") or 0),
+        title=str(room_data.get("title") or ""),
+        parent_area_id=str(room_data.get("parent_area_id") or ""),
+        area_id=str(room_data.get("area_id") or ""),
+        is_live=int(room_data.get("live_status") or 0) == 1,
+    )
 
 
 async def _request_json(
@@ -144,6 +195,16 @@ async def get_area_list(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
         headers={"Origin": BASE_URL},
     )
     return list(data)
+
+
+async def get_room_info(session: aiohttp.ClientSession, room_id: int) -> RoomInfo:
+    data = await _request_json(
+        session,
+        "GET",
+        f"/room/v1/Room/get_info?room_id={room_id}",
+        headers={"Origin": BASE_URL},
+    )
+    return parse_room_info(data)
 
 
 async def get_live_version(session: aiohttp.ClientSession, now_ms: int | None = None) -> LiveVersion:

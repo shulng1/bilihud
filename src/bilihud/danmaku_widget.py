@@ -580,6 +580,18 @@ class DanmakuWidget(QWidget):
             font-size: 12px;
             letter-spacing: 0.5px;
         """)
+
+        self.live_status_dot = QLabel()
+        self.live_status_dot.setFixedSize(8, 8)
+        self.live_status_dot.setToolTip("直播中")
+        self.live_status_dot.setStyleSheet("""
+            QLabel {
+                background-color: #ff2d55;
+                border: 1px solid rgba(255, 255, 255, 180);
+                border-radius: 4px;
+            }
+        """)
+        self.live_status_dot.hide()
         
         # 房间号输入
         self.room_id_input = QLineEdit(str(self.room_id))
@@ -659,6 +671,7 @@ class DanmakuWidget(QWidget):
 
         # 组装 Header
         self.header_layout.addWidget(self.title_label)
+        self.header_layout.addWidget(self.live_status_dot)
         self.header_layout.addWidget(self.room_id_input)
         self.header_layout.addWidget(self.connect_button)
         self.header_layout.addWidget(self.gaming_mode_btn)
@@ -1202,10 +1215,16 @@ class DanmakuWidget(QWidget):
         """打开直播控制窗口"""
         if not hasattr(self, '_live_control_dialog'):
             self._live_control_dialog = LiveControlDialog(self)
+            self._live_control_dialog.live_status_changed.connect(self.set_live_status_indicator)
         self._live_control_dialog.set_room_id(self.room_id)
         self._live_control_dialog.show()
         self._live_control_dialog.raise_()
         self._live_control_dialog.activateWindow()
+
+    def set_live_status_indicator(self, is_live: bool):
+        """显示或隐藏标题栏直播状态点。"""
+        if hasattr(self, 'live_status_dot'):
+            self.live_status_dot.setVisible(is_live)
 
     def open_qr_login(self):
         """打开扫码登录窗口"""
