@@ -53,6 +53,7 @@ class LiveControlDialog(QDialog):
         self.credentials: list[StreamCredential] = []
         self._initial_load_task: asyncio.Task[None] | None = None
         self._load_generation = 0
+        self._action_generation = 0
         self._session_cleanup_task: asyncio.Task[None] | None = None
         self._sessions_pending_close: list[aiohttp.ClientSession] = []
         self._busy = False
@@ -206,6 +207,7 @@ class LiveControlDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._load_generation += 1
+        self._action_generation += 1
         if self._initial_load_task and not self._initial_load_task.done():
             self._initial_load_task.cancel()
         self._clear_credentials()
@@ -370,10 +372,24 @@ class LiveControlDialog(QDialog):
             }
         )
 
+    def _begin_action(self) -> int:
+        self._action_generation += 1
+        return self._action_generation
+
+    def _is_current_action(self, generation: int, session: aiohttp.ClientSession) -> bool:
+        return (
+            generation == self._action_generation
+            and self.isVisible()
+            and self.session is session
+            and not session.closed
+        )
+
     @qasync.asyncSlot()
     async def handle_update_title(self) -> None:
-        if not self.session:
+        session = self.session
+        if not session:
             return
+        action_generation = self._begin_action()
         room_id = self._room_id()
         title = self.title_input.text().strip()
         if room_id is None or not title:
@@ -381,19 +397,25 @@ class LiveControlDialog(QDialog):
             return
         self._set_busy(True, "正在更新标题...")
         try:
-            await update_room_title(self.session, room_id, title)
+            await update_room_title(session, room_id, title)
+            if not self._is_current_action(action_generation, session):
+                return
             self._save_form_config()
             self.set_status("直播间标题已更新。")
         except Exception as exc:
-            logger.exception("Failed to update room title")
-            self.set_status(f"更新标题失败: {exc}", error=True)
+            if self._is_current_action(action_generation, session):
+                logger.exception("Failed to update room title")
+                self.set_status(f"更新标题失败: {exc}", error=True)
         finally:
-            self._set_busy(False)
+            if self._is_current_action(action_generation, session):
+                self._set_busy(False)
 
     @qasync.asyncSlot()
     async def handle_update_area(self) -> None:
-        if not self.session:
+        session = self.session
+        if not session:
             return
+        action_generation = self._begin_action()
         room_id = self._room_id()
         area_id = self._selected_area_id()
         if room_id is None or not area_id:
@@ -401,19 +423,25 @@ class LiveControlDialog(QDialog):
             return
         self._set_busy(True, "正在更新分区...")
         try:
-            await update_room_area(self.session, room_id, area_id)
+            await update_room_area(session, room_id, area_id)
+            if not self._is_current_action(action_generation, session):
+                return
             self._save_form_config()
             self.set_status("直播间分区已更新。")
         except Exception as exc:
-            logger.exception("Failed to update room area")
-            self.set_status(f"更新分区失败: {exc}", error=True)
+            if self._is_current_action(action_generation, session):
+                logger.exception("Failed to update room area")
+                self.set_status(f"更新分区失败: {exc}", error=True)
         finally:
-            self._set_busy(False)
+            if self._is_current_action(action_generation, session):
+                self._set_busy(False)
 
     @qasync.asyncSlot()
     async def handle_start_live(self) -> None:
-        if not self.session:
+        session = self.session
+        if not session:
             return
+        action_generation = self._begin_action()
         room_id = self._room_id()
         title = self.title_input.text().strip()
         area_id = self._selected_area_id()
@@ -424,19 +452,30 @@ class LiveControlDialog(QDialog):
         self._set_busy(True, "正在开始直播...")
         try:
             self._save_form_config()
-            await update_room_title(self.session, room_id, title)
-            await update_room_area(self.session, room_id, area_id)
-            version = await get_live_version(self.session)
-            result = await start_live(self.session, room_id, area_id, version.curr_version, str(version.build))
+            await update_room_title(session, room_id, title)
+            if not self._is_current_action(action_generation, session):
+                return
+            await update_room_area(session, room_id, area_id)
+            if not self._is_current_action(action_generation, session):
+                return
+            version = await get_live_version(session)
+            if not self._is_current_action(action_generation, session):
+                return
+            result = await start_live(session, room_id, area_id, version.curr_version, str(version.build))
+            if not self._is_current_action(action_generation, session):
+                return
             self._handle_start_live_result(result.code, result.message, result.data)
         except LiveApiError as exc:
-            logger.exception("Live API error while starting live")
-            self.set_status(str(exc), error=True)
+            if self._is_current_action(action_generation, session):
+                logger.exception("Live API error while starting live")
+                self.set_status(str(exc), error=True)
         except Exception as exc:
-            logger.exception("Failed to start live")
-            self.set_status(f"开始直播失败: {exc}", error=True)
+            if self._is_current_action(action_generation, session):
+                logger.exception("Failed to start live")
+                self.set_status(f"开始直播失败: {exc}", error=True)
         finally:
-            self._set_busy(False)
+            if self._is_current_action(action_generation, session):
+                self._set_busy(False)
 
     def _handle_start_live_result(self, code: int, message: str, data: dict[str, Any]) -> None:
         if code == 0:
@@ -474,8 +513,10 @@ class LiveControlDialog(QDialog):
 
     @qasync.asyncSlot()
     async def handle_stop_live(self) -> None:
-        if not self.session:
+        session = self.session
+        if not session:
             return
+        action_generation = self._begin_action()
         room_id = self._room_id()
         if room_id is None:
             self.set_status("房间号无效。", error=True)
@@ -483,14 +524,18 @@ class LiveControlDialog(QDialog):
 
         self._set_busy(True, "正在停止直播...")
         try:
-            await stop_live(self.session, room_id)
+            await stop_live(session, room_id)
+            if not self._is_current_action(action_generation, session):
+                return
             self._clear_credentials()
             self.set_status("直播已停止。")
         except Exception as exc:
-            logger.exception("Failed to stop live")
-            self.set_status(f"停止直播失败: {exc}", error=True)
+            if self._is_current_action(action_generation, session):
+                logger.exception("Failed to stop live")
+                self.set_status(f"停止直播失败: {exc}", error=True)
         finally:
-            self._set_busy(False)
+            if self._is_current_action(action_generation, session):
+                self._set_busy(False)
 
     def _clear_credentials(self) -> None:
         self.credentials = []
